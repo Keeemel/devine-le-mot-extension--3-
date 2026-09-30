@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      width: 296px;
+      min-height: 188px;
+      font: 13px/1.5 system-ui, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background: #142022;
+      color: #e9f1ef;
+    }
+    h1 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+      margin: 0 0 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #34494a;
+    }
+    #status {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 38px;
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      border: 1px solid #34494a;
+      border-radius: 5px;
+      background: #1b2a2c;
+      color: #b7c6c3;
+      font-size: 12px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      flex: 0 0 8px;
+      border-radius: 50%;
+      background: #849391;
+    }
+    #status[data-state="active"] .status-dot { background: #79e0b8; }
+    #status[data-state="paused"] .status-dot { background: #f3c979; }
+    #status[data-state="error"] .status-dot { background: #ff9b82; }
+    button {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #recalibrate { background: #79e0b8; color: #10201b; }
+    #pause { background: #263738; border-color: #465c5b; color: #e9f1ef; }
+    button:hover { filter: brightness(1.08); }
+    button:focus-visible { outline: 2px solid #79e0b8; outline-offset: 2px; }
+    @media (prefers-reduced-motion: no-preference) {
+      body { animation: popup-in 140ms ease-out both; }
+      @keyframes popup-in {
+        from { opacity: 0; transform: translateY(-3px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1><span aria-hidden="true">🔎</span> Devine le Mot</h1>
+  <div id="status" data-state="loading" role="status" aria-live="polite">
+    <span class="status-dot" aria-hidden="true"></span>
+    <span class="status-text">Vérification…</span>
+  </div>
+  <button id="recalibrate">Recalibrer la zone</button>
+  <button id="pause">Pause / Reprendre</button>
+  <script src="popup.js"></script>
+</body>
+</html>

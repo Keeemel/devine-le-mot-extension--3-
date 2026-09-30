@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Devine le Mot - Assistant OCR",
+  "version": "1.0.0",
+  "description": "Détecte le mot mystère affiché en image (OCR local) et propose des candidats compatibles. 100% local, aucun appel réseau.",
+  "permissions": ["storage", "activeTab", "scripting", "offscreen"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["offscreen.html", "lib/*", "tessdata/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
