@@ -1,373 +1,709 @@
-// ocr.js — s'exécute dans le document offscreen (accès DOM/canvas complet).
-// Pipeline : crop -> niveaux de gris -> binarisation et segmentation à la
-// résolution native -> upscale des seules cases de lettres -> OCR Tesseract.
+// content.js — UI de calibration, overlay de résultats, boucle de scan.
+(() => {
+  const HOSTNAME = location.hostname || "local-file";
+  const STORAGE_KEY = "dlm_calibrations";
+  // Chrome limite captureVisibleTab à 2 appels/seconde
+  // (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND). On vise ce plafond au plus
+  // près (550 ms de marge) plutôt qu'un intervalle fixe conservateur : la
+  // boucle se reprogramme elle-même juste après chaque scan, donc elle va
+  // aussi vite que le pipeline OCR le permet sans jamais dépasser la limite.
+  const MIN_SCAN_GAP_MS = 550;
+  const CONFIDENCE_WARNING_THRESHOLD = 60;
+  const CANDIDATE_BATCH_SIZE = 100;
 
-const UPSCALE = 4;
-const BIN_THRESHOLD = 150; // luminance 0-255 ; fond sombre / lettres claires
-const MIN_FG_PIXELS_PER_COL = 1; // colonne considérée "vide" en dessous
-const UNDERSCORE_HEIGHT_RATIO = 0.33; // hauteur de blob / hauteur totale
-const OCR_CACHE_LIMIT = 256;
-// En dessous de ce score, une lecture est trop incertaine pour être imposée
-// comme lettre "dure" dans le pattern : une lettre mal lue mais acceptée
-// élimine silencieusement le bon mot du filtrage par regex. On préfère
-// afficher "_" (modifiable à la main) plutôt qu'une lettre probablement
-// fausse — moins spectaculaire mais beaucoup plus fiable.
-const LETTER_CONFIDENCE_THRESHOLD = 55;
-
-let tesseractScheduler = null;
-let schedulerPromise = null;
-let additionalWorkerPromise = null;
-const ocrCache = new Map();
-
-function segmentFingerprint(fg, imageWidth, seg, totalHeight) {
-  const segmentWidth = seg.x1 - seg.x0 + 1;
-  let firstHash = 2166136261;
-  let secondHash = 5381;
-
-  for (let y = 0; y < totalHeight; y++) {
-    for (let x = seg.x0; x <= seg.x1; x++) {
-      const pixel = fg[y * imageWidth + x];
-      firstHash = Math.imul(firstHash ^ pixel, 16777619);
-      secondHash = Math.imul(secondHash, 33) ^ pixel;
-    }
-  }
-
-  return `${segmentWidth}x${totalHeight}:${firstHash >>> 0}:${secondHash >>> 0}`;
-}
-
-async function createTesseractWorker() {
-  const worker = await Tesseract.createWorker("fra", 1, {
-    workerPath: chrome.runtime.getURL("lib/worker.min.js"),
-    corePath: chrome.runtime.getURL("lib/tesseract-core-simd-lstm.wasm.js"),
-    langPath: chrome.runtime.getURL("tessdata"),
-    cacheMethod: "none",
-    // Indispensable dans une extension Chrome : par défaut tesseract.js
-    // instancie son worker via un Blob ("blob:" origin), qui n'a pas le
-    // droit d'importScripts() une ressource chrome-extension://... même
-    // listée en web_accessible_resources. En désactivant workerBlobURL,
-    // le worker est instancié directement depuis workerPath (même
-    // origine que l'extension) et peut importScripts ses dépendances
-    // normalement.
-    workerBlobURL: false,
-    logger: () => { },
-  });
-
-  await worker.setParameters({
-    tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    tessedit_pageseg_mode: "10", // PSM 10 = caractère unique
-  });
-  return worker;
-}
-
-function getScheduler() {
-  if (tesseractScheduler) return Promise.resolve(tesseractScheduler);
-  if (schedulerPromise) return schedulerPromise;
-
-  const scheduler = Tesseract.createScheduler();
-  schedulerPromise = createTesseractWorker()
-    .then((worker) => {
-      scheduler.addWorker(worker);
-      tesseractScheduler = scheduler;
-      // Préchauffe un 2e worker tout de suite (pendant que l'utilisateur
-      // calibre, avant la première vraie lettre à lire) plutôt que
-      // d'attendre réactivement d'avoir plusieurs cases en attente : la
-      // toute première salve de reconnaissance de la partie profite déjà
-      // du parallélisme au lieu de tourner sur un seul worker.
-      warmAdditionalWorker();
-      return scheduler;
-    })
-    .catch((error) => {
-      schedulerPromise = null;
-      throw error;
-    });
-
-  return schedulerPromise;
-}
-
-function warmAdditionalWorker() {
-  if (!tesseractScheduler || additionalWorkerPromise) return;
-
-  additionalWorkerPromise = createTesseractWorker()
-    .then((worker) => tesseractScheduler.addWorker(worker))
-    .catch(() => { });
-
-}
-
-/**
- * N'accepte une lettre reconnue que si l'OCR est assez confiant ; sinon
- * renvoie "_" pour ne pas fausser le filtrage par regex avec une lettre
- * probablement incorrecte.
- */
-function acceptLetter(char, confidence) {
-  return confidence >= LETTER_CONFIDENCE_THRESHOLD ? char : "_";
-}
-
-function loadImage(dataUrl) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = dataUrl;
-  });
-}
-
-/**
- * Croppe la zone calibrée à la résolution native. L'upscale est reporté sur
- * les seules cases envoyées à Tesseract.
- */
-function cropRegion(img, rect) {
-  const w = Math.max(1, Math.round(rect.width));
-  const h = Math.max(1, Math.round(rect.height));
-
-  const canvas = new OffscreenCanvas(w, h);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, rect.x, rect.y, w, h, 0, 0, w, h);
-  return { canvas, ctx, width: w, height: h };
-}
-
-/**
- * Convertit en niveaux de gris + binarise (noir/blanc) in-place.
- * Retourne aussi un tableau Uint8Array "foreground" (1 = lettre/trait).
- */
-function binarize(ctx, width, height) {
-  const imageData = ctx.getImageData(0, 0, width, height);
-  const data = imageData.data;
-  const fg = new Uint8Array(width * height);
-
-  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    const isFg = lum > BIN_THRESHOLD ? 1 : 0;
-    fg[p] = isFg;
-    const v = isFg ? 255 : 0;
-    data[i] = data[i + 1] = data[i + 2] = v;
-    data[i + 3] = 255;
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return fg;
-}
-
-/**
- * Segmente l'image binaire en "cases" (blobs) via projection sur les
- * colonnes : une case = plage de colonnes contenant du premier plan,
- * séparée des voisines par un espace de fond.
- */
-function segmentColumns(fg, width, height) {
-  const columnPixelCounts = new Uint32Array(width);
-  const columnMinY = new Uint32Array(width);
-  const columnMaxY = new Int32Array(width);
-  columnMinY.fill(height);
-  columnMaxY.fill(-1);
-
-  for (let y = 0; y < height; y++) {
-    const rowOffset = y * width;
-    for (let x = 0; x < width; x++) {
-      if (!fg[rowOffset + x]) continue;
-      columnPixelCounts[x]++;
-      if (columnMinY[x] === height) columnMinY[x] = y;
-      columnMaxY[x] = y;
-    }
-  }
-
-  const segments = [];
-  function addSegment(x0, x1) {
-    let minY = height;
-    let maxY = -1;
-    for (let x = x0; x <= x1; x++) {
-      minY = Math.min(minY, columnMinY[x]);
-      maxY = Math.max(maxY, columnMaxY[x]);
-    }
-    segments.push({ x0, x1, y0: minY, y1: maxY });
-  }
-
-  let start = -1;
-  for (let x = 0; x < width; x++) {
-    const hasForeground = columnPixelCounts[x] >= MIN_FG_PIXELS_PER_COL;
-    if (hasForeground && start === -1) {
-      start = x;
-    } else if (!hasForeground && start !== -1) {
-      addSegment(start, x - 1);
-      start = -1;
-    }
-  }
-  if (start !== -1) addSegment(start, width - 1);
-  return segments;
-}
-
-function segmentFixedSlots(fg, width, height, slotCount) {
-  const segments = [];
-  for (let slot = 0; slot < slotCount; slot++) {
-    const slotStart = Math.floor((slot * width) / slotCount);
-    const slotEnd = Math.max(slotStart, Math.floor(((slot + 1) * width) / slotCount) - 1);
-    let x0 = slotEnd + 1;
-    let x1 = -1;
-    let y0 = height;
-    let y1 = -1;
-
-    for (let y = 0; y < height; y++) {
-      const rowOffset = y * width;
-      for (let x = slotStart; x <= slotEnd; x++) {
-        if (!fg[rowOffset + x]) continue;
-        x0 = Math.min(x0, x);
-        x1 = Math.max(x1, x);
-        y0 = Math.min(y0, y);
-        y1 = Math.max(y1, y);
-      }
-    }
-
-    segments.push(
-      x1 < 0
-        ? { x0: slotStart, x1: slotEnd, y0: height, y1: -1, empty: true }
-        : { x0, x1, y0, y1 }
-    );
-  }
-  return segments;
-}
-
-/**
- * Heuristique : un "_" est un blob bas et fin, positionné dans la moitié
- * inférieure de la case. Une vraie lettre occupe une hauteur bien plus
- * grande. Evite de demander à l'OCR de reconnaître "_" (peu fiable).
- */
-function isUnderscoreSegment(seg, totalHeight) {
-  const blobHeight = seg.y1 - seg.y0 + 1;
-  const heightRatio = blobHeight / totalHeight;
-  const verticalCenter = (seg.y0 + seg.y1) / 2 / totalHeight;
-  return heightRatio < UNDERSCORE_HEIGHT_RATIO && verticalCenter > 0.5;
-}
-
-function extractSegmentCanvas(sourceCanvas, seg, totalHeight, padding = 6) {
-  const segmentWidth = seg.x1 - seg.x0 + 1;
-  const scaledWidth = segmentWidth * UPSCALE;
-  const scaledHeight = totalHeight * UPSCALE;
-  const w = scaledWidth + padding * 2;
-  const h = scaledHeight + padding * 2;
-  const out = new OffscreenCanvas(w, h);
-  const ctx = out.getContext("2d");
-  ctx.fillStyle = "black";
-  ctx.fillRect(0, 0, w, h);
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(
-    sourceCanvas,
-    seg.x0,
-    0,
-    segmentWidth,
-    totalHeight,
-    padding,
-    padding,
-    scaledWidth,
-    scaledHeight
-  );
-  return out;
-}
-
-/**
- * Pipeline complet : capture (dataUrl) + rect calibré -> pattern texte
- * (ex: "_A__E_") + score de confiance moyen.
- */
-async function runOcrPipeline(dataUrl, rect, referenceLength = null) {
-  const img = await loadImage(dataUrl);
-  const { canvas, ctx, width, height } = cropRegion(img, rect);
-  const fg = binarize(ctx, width, height);
-  let segments = segmentColumns(fg, width, height);
-  if (
-    Number.isInteger(referenceLength) &&
-    referenceLength > 0 &&
-    referenceLength <= 20 &&
-    segments.length !== referenceLength
-  ) {
-    segments = segmentFixedSlots(fg, width, height, referenceLength);
-  }
-
-  if (segments.length === 0) {
-    return { ok: false, error: "Aucune case détectée (zone vide ou mal calibrée)." };
-  }
-
-  const schedulerInitialization = getScheduler();
-  const letters = new Array(segments.length);
-  const confidences = [];
-  const pendingByFingerprint = new Map();
-
-  for (let index = 0; index < segments.length; index++) {
-    const seg = segments[index];
-    if (seg.empty || isUnderscoreSegment(seg, height)) {
-      letters[index] = "_";
-      continue;
-    }
-
-    const fingerprint = segmentFingerprint(fg, width, seg, height);
-    const cached = ocrCache.get(fingerprint);
-    if (cached) {
-      ocrCache.delete(fingerprint);
-      ocrCache.set(fingerprint, cached);
-      letters[index] = acceptLetter(cached.char, cached.confidence);
-      confidences.push(cached.confidence);
-      continue;
-    }
-
-    let pendingItem = pendingByFingerprint.get(fingerprint);
-    if (pendingItem) {
-      pendingItem.indices.push(index);
-      continue;
-    }
-
-    const segCanvas = extractSegmentCanvas(canvas, seg, height);
-    pendingByFingerprint.set(fingerprint, {
-      indices: [index],
-      fingerprint,
-      blobPromise: segCanvas.convertToBlob({ type: "image/png" }),
-    });
-  }
-
-  const pending = [...pendingByFingerprint.values()];
-  if (pending.length === 0) {
-    schedulerInitialization
-      .then(warmAdditionalWorker)
-      .catch(() => { });
-  } else {
-    const scheduler = await schedulerInitialization;
-    if (pending.length >= 3) warmAdditionalWorker();
-
-    const results = await Promise.all(
-      pending.map(async (item) => {
-        const blob = await item.blobPromise;
-        const { data } = await scheduler.addJob("recognize", blob);
-        const raw = (data.text || "").trim().toUpperCase();
-        return {
-          ...item,
-          char: raw.match(/[A-Z]/)?.[0] || "_",
-          confidence: data.confidence ?? 0,
-        };
-      })
-    );
-
-    for (const result of results) {
-      for (const index of result.indices) {
-        letters[index] = acceptLetter(result.char, result.confidence);
-        confidences.push(result.confidence);
-      }
-      ocrCache.set(result.fingerprint, {
-        char: result.char,
-        confidence: result.confidence,
-      });
-      if (ocrCache.size > OCR_CACHE_LIMIT) {
-        ocrCache.delete(ocrCache.keys().next().value);
-      }
-    }
-  }
-
-  const avgConfidence =
-    confidences.length > 0
-      ? Math.round(confidences.reduce((a, b) => a + b, 0) / confidences.length)
-      : 100;
-
-  return {
-    ok: true,
-    pattern: letters.join(""),
-    confidence: avgConfidence,
-    segmentCount: segments.length,
+  let state = {
+    rect: null, // {x, y, width, height} en CSS px, relatif au viewport
+    referenceLength: null,
+    scanning: false,
+    paused: false,
+    intervalId: null,
+    pendingPattern: null,
+    pendingCount: 0,
+    lastValidatedPattern: null,
+    lastConfidence: null,
+    manualOverrides: new Map(),
+    manualPattern: null,
+    manualSolveRequest: 0,
+    inFlight: false,
   };
-}
 
-// Exposé pour offscreen.js
-window.__ocrPipeline = { runOcrPipeline };
+  // ---------- Stockage ----------
+  async function loadCalibration() {
+    const all = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY] || {};
+    return all[HOSTNAME] || null;
+  }
+
+  async function saveCalibration(rect, referenceLength) {
+    const all = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY] || {};
+    all[HOSTNAME] = { rect, referenceLength };
+    await chrome.storage.local.set({ [STORAGE_KEY]: all });
+  }
+
+  // ---------- Overlay de calibration ----------
+  function startCalibration(existingRect) {
+    stopScanning();
+
+    const backdrop = document.createElement("div");
+    backdrop.id = "dlm-calib-backdrop";
+    document.body.appendChild(backdrop);
+
+    const box = document.createElement("div");
+    box.id = "dlm-calib-box";
+    const initial = existingRect || {
+      x: window.innerWidth / 2 - 100,
+      y: window.innerHeight / 2 - 40,
+      width: 200,
+      height: 80,
+    };
+    Object.assign(box.style, {
+      left: `${initial.x}px`,
+      top: `${initial.y}px`,
+      width: `${initial.width}px`,
+      height: `${initial.height}px`,
+    });
+    document.body.appendChild(box);
+
+    ["nw", "ne", "sw", "se"].forEach((corner) => {
+      const h = document.createElement("div");
+      h.className = `dlm-handle ${corner}`;
+      box.appendChild(h);
+    });
+
+    const panel = document.createElement("div");
+    panel.id = "dlm-calib-panel";
+    panel.innerHTML = `
+      <span>Zone du mot : cadre + déplace/redimensionne</span>
+      <label>Lettres&nbsp;<input type="number" id="dlm-ref-length" min="1" max="20" placeholder="?" /></label>
+      <button id="dlm-calib-validate">Valider</button>
+      <button id="dlm-calib-cancel">Annuler</button>
+    `;
+    document.body.appendChild(panel);
+    positionPanelBelowBox();
+
+    const refInput = panel.querySelector("#dlm-ref-length");
+    if (existingRect && state.referenceLength) refInput.value = state.referenceLength;
+
+    function positionPanelBelowBox() {
+      const r = box.getBoundingClientRect();
+      panel.style.left = `${Math.max(8, r.left)}px`;
+      panel.style.top = `${r.bottom + 10}px`;
+    }
+
+    // --- Déplacement de la box (drag depuis son intérieur) ---
+    let dragMode = null; // 'move' | 'nw' | 'ne' | 'sw' | 'se'
+    let dragStart = null;
+
+    function onBoxMouseDown(e, mode) {
+      e.preventDefault();
+      e.stopPropagation();
+      dragMode = mode;
+      const r = box.getBoundingClientRect();
+      dragStart = {
+        mouseX: e.clientX,
+        mouseY: e.clientY,
+        x: r.left,
+        y: r.top,
+        width: r.width,
+        height: r.height,
+      };
+    }
+
+    box.addEventListener("mousedown", (e) => {
+      if (e.target.classList.contains("dlm-handle")) return;
+      onBoxMouseDown(e, "move");
+    });
+    box.querySelectorAll(".dlm-handle").forEach((h) => {
+      const corner = [...h.classList].find((c) => c !== "dlm-handle");
+      h.addEventListener("mousedown", (e) => onBoxMouseDown(e, corner));
+    });
+
+    function onMouseMove(e) {
+      if (!dragMode) return;
+      const dx = e.clientX - dragStart.mouseX;
+      const dy = e.clientY - dragStart.mouseY;
+      let { x, y, width, height } = dragStart;
+
+      if (dragMode === "move") {
+        x += dx;
+        y += dy;
+      } else {
+        if (dragMode.includes("e")) width = Math.max(20, dragStart.width + dx);
+        if (dragMode.includes("s")) height = Math.max(16, dragStart.height + dy);
+        if (dragMode.includes("w")) {
+          width = Math.max(20, dragStart.width - dx);
+          x = dragStart.x + dx;
+        }
+        if (dragMode.includes("n")) {
+          height = Math.max(16, dragStart.height - dy);
+          y = dragStart.y + dy;
+        }
+      }
+
+      Object.assign(box.style, {
+        left: `${x}px`,
+        top: `${y}px`,
+        width: `${width}px`,
+        height: `${height}px`,
+      });
+      positionPanelBelowBox();
+    }
+
+    function onMouseUp() {
+      dragMode = null;
+    }
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+
+    function cleanup() {
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+      backdrop.remove();
+      box.remove();
+      panel.remove();
+    }
+
+    panel.querySelector("#dlm-calib-cancel").addEventListener("click", () => {
+      cleanup();
+      if (state.rect) startScanning(); // reprend si une calibration existait déjà
+    });
+
+    panel.querySelector("#dlm-calib-validate").addEventListener("click", async () => {
+      const r = box.getBoundingClientRect();
+      const rect = { x: r.left, y: r.top, width: r.width, height: r.height };
+      const referenceLength = refInput.value ? parseInt(refInput.value, 10) : null;
+
+      await saveCalibration(rect, referenceLength);
+      state.rect = rect;
+      state.referenceLength = referenceLength;
+
+      cleanup();
+      startScanning();
+    });
+  }
+
+  // ---------- Overlay de résultats ----------
+  let overlayEls = null;
+  let candidateEntries = [];
+  let renderedCandidateCount = 0;
+  let renderedCandidatePattern = null;
+  let renderedInputPattern = null;
+  let copyStatusTimer = null;
+
+  function ensureResultOverlay() {
+    if (overlayEls) return overlayEls;
+
+    const root = document.createElement("div");
+    root.id = "dlm-result-overlay";
+    root.innerHTML = `
+      <div id="dlm-result-header">
+        <span class="dlm-brand"><span>🔎 Devine le Mot</span><span class="dlm-local-ai">IA LOCALE</span></span>
+        <span>
+          <button id="dlm-new-word" title="Réinitialiser pour un nouveau mot" aria-label="Nouveau mot">↻</button>
+          <button id="dlm-pause" title="Pause/Reprendre" aria-label="Pause ou reprise">⏸</button>
+          <button id="dlm-recalibrate" title="Recalibrer" aria-label="Recalibrer">⚙️</button>
+        </span>
+      </div>
+      <div id="dlm-result-body">
+        <div id="dlm-pattern" aria-label="Mot détecté"></div>
+        <div id="dlm-confidence">confiance: –</div>
+        <div id="dlm-copy-status" aria-live="polite"></div>
+        <ul id="dlm-candidates"></ul>
+        <div id="dlm-warning" style="display:none;"></div>
+      </div>
+    `;
+    document.body.appendChild(root);
+
+    // drag via le header
+    const header = root.querySelector("#dlm-result-header");
+    let dragging = false;
+    let start = null;
+    header.addEventListener("mousedown", (e) => {
+      if (e.target.tagName === "BUTTON") return;
+      dragging = true;
+      const r = root.getBoundingClientRect();
+      start = { mouseX: e.clientX, mouseY: e.clientY, x: r.left, y: r.top };
+      root.style.right = "auto";
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      root.style.left = `${start.x + (e.clientX - start.mouseX)}px`;
+      root.style.top = `${start.y + (e.clientY - start.mouseY)}px`;
+    });
+    document.addEventListener("mouseup", () => (dragging = false));
+
+    root.querySelector("#dlm-pause").addEventListener("click", () => {
+      state.paused = !state.paused;
+      root.querySelector("#dlm-pause").textContent = state.paused ? "▶" : "⏸";
+    });
+    root.querySelector("#dlm-recalibrate").addEventListener("click", () => {
+      startCalibration(state.rect);
+    });
+    root.querySelector("#dlm-new-word").addEventListener("click", resetCurrentWord);
+    root.querySelector("#dlm-pattern").addEventListener("input", handleManualLetterInput);
+    root.querySelector("#dlm-candidates").addEventListener("click", (event) => {
+      const item = event.target.closest("li[data-word]");
+      if (item) copyWord(item.dataset.word);
+    });
+    root.querySelector("#dlm-candidates").addEventListener("keydown", (event) => {
+      const item = event.target.closest("li[data-word]");
+      if (item && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        copyWord(item.dataset.word);
+      }
+    });
+    root.querySelector("#dlm-candidates").addEventListener("scroll", () => {
+      if (overlayEls.candidates.scrollTop + overlayEls.candidates.clientHeight >=
+        overlayEls.candidates.scrollHeight - 32) {
+        renderCandidateBatch();
+      }
+    });
+
+    overlayEls = {
+      root,
+      pattern: root.querySelector("#dlm-pattern"),
+      confidence: root.querySelector("#dlm-confidence"),
+      copyStatus: root.querySelector("#dlm-copy-status"),
+      candidates: root.querySelector("#dlm-candidates"),
+      warning: root.querySelector("#dlm-warning"),
+    };
+    return overlayEls;
+  }
+
+  function renderCandidateBatch() {
+    if (!overlayEls || renderedCandidateCount >= candidateEntries.length) return;
+
+    const end = Math.min(
+      renderedCandidateCount + CANDIDATE_BATCH_SIZE,
+      candidateEntries.length
+    );
+    const fragment = document.createDocumentFragment();
+    for (; renderedCandidateCount < end; renderedCandidateCount++) {
+      const item = document.createElement("li");
+      const word = candidateEntries[renderedCandidateCount].word;
+      item.textContent = word;
+      item.dataset.word = word;
+      item.tabIndex = 0;
+      item.setAttribute("role", "button");
+      fragment.appendChild(item);
+    }
+    overlayEls.candidates.appendChild(fragment);
+  }
+
+  function setCandidateList(pattern, candidates, force = false) {
+    if (renderedCandidatePattern === pattern && !force) return;
+
+    renderedCandidatePattern = pattern;
+    candidateEntries = candidates;
+    renderedCandidateCount = 0;
+    overlayEls.candidates.replaceChildren();
+    if (candidateEntries.length === 0) {
+      const item = document.createElement("li");
+      item.textContent = "Aucun candidat";
+      overlayEls.candidates.appendChild(item);
+      return;
+    }
+    renderCandidateBatch();
+  }
+
+  function renderEditablePattern(pattern) {
+    if (renderedInputPattern === pattern) return;
+
+    const activeInput = document.activeElement?.closest?.(".dlm-letter-input");
+    const focusedIndex = activeInput ? Number(activeInput.dataset.index) : null;
+    overlayEls.pattern.replaceChildren();
+
+    [...pattern].forEach((letter, index) => {
+      const input = document.createElement("input");
+      input.className = "dlm-letter-input";
+      input.type = "text";
+      input.maxLength = 1;
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.value = letter;
+      input.dataset.index = index;
+      input.setAttribute("aria-label", `Lettre ${index + 1}, modifier`);
+      input.title = "Corriger cette lettre";
+      overlayEls.pattern.appendChild(input);
+    });
+    renderedInputPattern = pattern;
+
+    if (focusedIndex !== null) {
+      const nextInput = overlayEls.pattern.querySelector(`[data-index="${focusedIndex}"]`);
+      nextInput?.focus();
+      nextInput?.select();
+    }
+  }
+
+  function applyManualOverrides(pattern) {
+    const letters = [...pattern];
+    for (const [index, letter] of state.manualOverrides) {
+      if (index < letters.length) letters[index] = letter;
+    }
+    return letters.join("");
+  }
+
+  function handleManualLetterInput(event) {
+    const input = event.target.closest(".dlm-letter-input");
+    if (!input) return;
+
+    const value = input.value.toUpperCase().replace(/[^A-Z_]/g, "").slice(0, 1);
+    const index = Number(input.dataset.index);
+    const basePattern = state.lastValidatedPattern || state.pendingPattern;
+    input.value = value;
+    if (!basePattern || index >= basePattern.length) return;
+
+    if (!value || value === basePattern[index]) {
+      state.manualOverrides.delete(index);
+    } else {
+      state.manualOverrides.set(index, value);
+    }
+
+    const pattern = applyManualOverrides(basePattern);
+    state.manualPattern = pattern;
+    renderedInputPattern = null;
+    renderEditablePattern(pattern);
+    requestManualCandidates(pattern);
+  }
+
+  async function requestManualCandidates(pattern) {
+    const requestId = ++state.manualSolveRequest;
+    overlayEls.confidence.textContent = `confiance: ${state.lastConfidence ?? "–"}% · calcul…`;
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "SOLVE_PATTERN",
+        pattern,
+      });
+      if (requestId !== state.manualSolveRequest || state.manualPattern !== pattern) return;
+      if (!response?.ok) return;
+
+      setCandidateList(pattern, response.candidates, true);
+      overlayEls.confidence.textContent =
+        `confiance: ${state.lastConfidence ?? "–"}% · ${response.candidates.length} mots`;
+    } catch (error) {
+      console.warn("[DevineLeMot] correction manuelle échouée:", error);
+    }
+  }
+
+  function insertIntoTwitchChat(word) {
+    if (!/(^|\.)twitch\.tv$/i.test(location.hostname)) return false;
+
+    const editableSelector = 'textarea, input, [contenteditable="true"], [role="textbox"]';
+    const chatRoots = document.querySelectorAll(
+      '[data-a-target="chat-input"], [data-test-selector="chat-input"]'
+    );
+    let input = null;
+    for (const root of chatRoots) {
+      if (root.matches(editableSelector)) {
+        input = root;
+        break;
+      }
+      input = root.querySelector(editableSelector);
+      if (input) break;
+    }
+    input ||= document.querySelector(
+      'textarea[aria-label*="chat" i], [contenteditable="true"][aria-label*="chat" i]'
+    );
+    if (!input) return false;
+
+    const insertedWord = word.toLowerCase();
+    input.focus();
+
+    if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
+      const currentValue = input.value;
+      const start = input.selectionStart ?? currentValue.length;
+      const end = input.selectionEnd ?? start;
+      const nextValue = currentValue.slice(0, start) + insertedWord + currentValue.slice(end);
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(input),
+        "value"
+      )?.set;
+      if (!valueSetter) return false;
+
+      valueSetter.call(input, nextValue);
+      input.setSelectionRange(start + insertedWord.length, start + insertedWord.length);
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: insertedWord,
+      }));
+      return true;
+    }
+
+    if (input.isContentEditable) {
+      const selection = window.getSelection();
+      let range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      if (!range || !input.contains(range.commonAncestorContainer)) {
+        range = document.createRange();
+        range.selectNodeContents(input);
+        range.collapse(false);
+      }
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      if (document.execCommand?.("insertText", false, insertedWord)) return true;
+
+      range.deleteContents();
+      const textNode = document.createTextNode(insertedWord);
+      range.insertNode(textNode);
+      range.setStartAfter(textNode);
+      range.collapse(true);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: insertedWord,
+      }));
+      return true;
+    }
+
+    return false;
+  }
+
+  function showCopyStatus(message, failed = false) {
+    overlayEls.copyStatus.textContent = message;
+    overlayEls.copyStatus.classList.toggle("failed", failed);
+    overlayEls.copyStatus.style.display = "block";
+    clearTimeout(copyStatusTimer);
+    copyStatusTimer = setTimeout(() => {
+      overlayEls.copyStatus.style.display = "none";
+    }, 1800);
+  }
+
+  async function copyWord(word) {
+    const copiedWord = word.toLowerCase();
+    if (insertIntoTwitchChat(copiedWord)) {
+      showCopyStatus(`${copiedWord} ajouté au chat Twitch · Entrée pour envoyer`);
+      return;
+    }
+
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(copiedWord);
+      copied = true;
+    } catch {
+      const input = document.createElement("textarea");
+      input.value = copiedWord;
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      copied = document.execCommand("copy");
+      input.remove();
+    }
+
+    const isTwitch = /(^|\.)twitch\.tv$/i.test(location.hostname);
+    showCopyStatus(
+      copied
+        ? isTwitch
+          ? `${copiedWord} copié · chat Twitch introuvable`
+          : `${copiedWord} copié`
+        : "Copie impossible",
+      !copied
+    );
+  }
+
+  function resetCurrentWord() {
+    state.pendingPattern = null;
+    state.pendingCount = 0;
+    state.lastValidatedPattern = null;
+    state.lastConfidence = null;
+    state.manualOverrides.clear();
+    state.manualPattern = null;
+    state.manualSolveRequest++;
+    candidateEntries = [];
+    renderedCandidateCount = 0;
+    renderedCandidatePattern = null;
+    renderedInputPattern = null;
+
+    if (!overlayEls) return;
+    overlayEls.pattern.replaceChildren();
+    overlayEls.confidence.textContent = "confiance: –";
+    overlayEls.confidence.classList.remove("low");
+    overlayEls.candidates.innerHTML = "<li>Recherche du nouveau mot…</li>";
+    overlayEls.warning.style.display = "none";
+  }
+
+  function renderResult({ pattern, confidence, candidates, plausible }) {
+    const els = ensureResultOverlay();
+    const displayPattern = applyManualOverrides(pattern);
+    renderEditablePattern(displayPattern);
+    state.lastConfidence = confidence;
+
+    if (state.manualOverrides.size > 0) {
+      if (displayPattern !== state.manualPattern) {
+        state.manualPattern = displayPattern;
+        requestManualCandidates(displayPattern);
+      }
+      if (renderedCandidatePattern !== displayPattern) {
+        setCandidateList(displayPattern, []);
+      }
+    } else if (candidates !== null && candidates !== undefined) {
+      setCandidateList(displayPattern, candidates);
+    } else if (renderedCandidatePattern !== displayPattern) {
+      setCandidateList(displayPattern, []);
+    }
+    const candidateCount =
+      renderedCandidatePattern === displayPattern ? candidateEntries.length : 0;
+    els.confidence.textContent = `confiance: ${confidence}% · ${candidateCount} mots`;
+    els.confidence.classList.toggle("low", confidence < CONFIDENCE_WARNING_THRESHOLD);
+
+    if (!plausible) {
+      els.warning.style.display = "block";
+      els.warning.textContent =
+        "⚠️ Lecture incohérente (longueur inattendue) — vérifie la calibration.";
+      return;
+    }
+    if (confidence < CONFIDENCE_WARNING_THRESHOLD) {
+      els.warning.style.display = "block";
+      els.warning.textContent = "⚠️ Confiance OCR faible — essaie de recalibrer.";
+    } else {
+      els.warning.style.display = "none";
+    }
+
+  }
+
+  // ---------- Boucle de scan (auto-régulée, pas d'intervalle fixe) ----------
+  let scanTimer = null;
+  let scanActive = false;
+
+  function startScanning() {
+    if (scanActive) return;
+    scanActive = true;
+    state.intervalId = true; // utilisé par GET_STATUS pour savoir si ça tourne
+    state.scanning = true;
+    state.paused = false;
+    ensureResultOverlay();
+    loop();
+  }
+
+  function stopScanning() {
+    scanActive = false;
+    state.intervalId = null;
+    state.scanning = false;
+    if (scanTimer) {
+      clearTimeout(scanTimer);
+      scanTimer = null;
+    }
+  }
+
+  async function loop() {
+    if (!scanActive) return;
+    const t0 = performance.now();
+    await tick();
+    if (!scanActive) return; // stoppé pendant le tick (ex: erreur fatale)
+    const elapsed = performance.now() - t0;
+    const delay = Math.max(0, MIN_SCAN_GAP_MS - elapsed);
+    scanTimer = setTimeout(loop, delay);
+  }
+
+  async function tick() {
+    if (state.paused || state.inFlight || !state.rect) return;
+    state.inFlight = true;
+
+    try {
+      const dpr = window.devicePixelRatio || 1;
+      const rectDevicePx = {
+        x: Math.round(state.rect.x * dpr),
+        y: Math.round(state.rect.y * dpr),
+        width: Math.round(state.rect.width * dpr),
+        height: Math.round(state.rect.height * dpr),
+      };
+
+      const response = await chrome.runtime.sendMessage({
+        target: "background",
+        type: "REQUEST_SCAN",
+        rect: rectDevicePx,
+        referenceLength: state.referenceLength,
+        knownPattern: state.lastValidatedPattern,
+      });
+
+      if (!response || !response.ok) {
+        const errMsg = response?.error || "";
+
+        // Erreurs transitoires : pas graves, on retente à la frame suivante.
+        const isQuota = /MAX_CAPTURE_VISIBLE_TAB/.test(errMsg);
+        const isTabBusy = /cannot be edited right now/.test(errMsg);
+        if (isQuota || isTabBusy) return;
+
+        // L'accès au site n'est pas (ou plus) accordé de façon persistante :
+        // le scan automatique ne peut pas fonctionner tant que l'utilisateur
+        // n'a pas mis l'accès sur "Sur tous les sites" pour ce domaine.
+        if (/activeTab.*not in effect/i.test(errMsg)) {
+          if (overlayEls) {
+            overlayEls.warning.style.display = "block";
+            overlayEls.warning.textContent =
+              "⚠️ Accès au site requis : chrome://extensions → Détails → Accès au site → \"Sur tous les sites\", puis recharge la page.";
+          }
+          return;
+        }
+
+        console.warn("[DevineLeMot] scan échoué:", errMsg);
+        return;
+      }
+
+      // Debounce : un pattern doit être lu 2 fois de suite avant d'être
+      // affiché comme "validé", pour absorber les lectures OCR isolées
+      // foireuses.
+      if (response.pattern === state.pendingPattern) {
+        state.pendingCount++;
+      } else {
+        state.pendingPattern = response.pattern;
+        state.pendingCount = 1;
+      }
+
+      if (state.pendingCount >= 2) {
+        state.lastValidatedPattern = response.pattern;
+        renderResult(response);
+      }
+    } catch (err) {
+      if (String(err).includes("Extension context invalidated")) {
+        // L'extension a été rechargée depuis chrome://extensions pendant
+        // que cette page était ouverte : ce content script est orphelin,
+        // inutile de continuer à spammer la console. Recharge la page.
+        stopScanning();
+        if (overlayEls) {
+          overlayEls.warning.style.display = "block";
+          overlayEls.warning.textContent =
+            "⚠️ Extension rechargée — recharge cette page (F5) pour reprendre.";
+        }
+        return;
+      }
+      console.warn("[DevineLeMot] erreur scan:", err);
+    } finally {
+      state.inFlight = false;
+    }
+  }
+
+  // ---------- Messages depuis le popup ----------
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.target !== "content") return false;
+
+    if (message.type === "START_CALIBRATION") {
+      startCalibration(state.rect);
+      sendResponse({ ok: true });
+    } else if (message.type === "GET_STATUS") {
+      sendResponse({
+        calibrated: !!state.rect,
+        scanning: !!state.intervalId,
+        paused: state.paused,
+      });
+    } else if (message.type === "TOGGLE_PAUSE") {
+      state.paused = !state.paused;
+      sendResponse({ paused: state.paused });
+    }
+    return true;
+  });
+
+  // ---------- Init ----------
+  (async () => {
+    const saved = await loadCalibration();
+    if (saved) {
+      state.rect = saved.rect;
+      state.referenceLength = saved.referenceLength;
+      startScanning();
+    }
+  })();
+})();
