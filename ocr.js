@@ -7,6 +7,12 @@ const BIN_THRESHOLD = 150; // luminance 0-255 ; fond sombre / lettres claires
 const MIN_FG_PIXELS_PER_COL = 1; // colonne considérée "vide" en dessous
 const UNDERSCORE_HEIGHT_RATIO = 0.33; // hauteur de blob / hauteur totale
 const OCR_CACHE_LIMIT = 256;
+// En dessous de ce score, une lecture est trop incertaine pour être imposée
+// comme lettre "dure" dans le pattern : une lettre mal lue mais acceptée
+// élimine silencieusement le bon mot du filtrage par regex. On préfère
+// afficher "_" (modifiable à la main) plutôt qu'une lettre probablement
+// fausse — moins spectaculaire mais beaucoup plus fiable.
+const LETTER_CONFIDENCE_THRESHOLD = 55;
 
 let tesseractScheduler = null;
 let schedulerPromise = null;
@@ -43,7 +49,7 @@ async function createTesseractWorker() {
     // origine que l'extension) et peut importScripts ses dépendances
     // normalement.
     workerBlobURL: false,
-    logger: () => {},
+    logger: () => { },
   });
 
   await worker.setParameters({
@@ -62,6 +68,12 @@ function getScheduler() {
     .then((worker) => {
       scheduler.addWorker(worker);
       tesseractScheduler = scheduler;
+      // Préchauffe un 2e worker tout de suite (pendant que l'utilisateur
+      // calibre, avant la première vraie lettre à lire) plutôt que
+      // d'attendre réactivement d'avoir plusieurs cases en attente : la
+      // toute première salve de reconnaissance de la partie profite déjà
+      // du parallélisme au lieu de tourner sur un seul worker.
+      warmAdditionalWorker();
       return scheduler;
     })
     .catch((error) => {
@@ -77,8 +89,17 @@ function warmAdditionalWorker() {
 
   additionalWorkerPromise = createTesseractWorker()
     .then((worker) => tesseractScheduler.addWorker(worker))
-    .catch(() => {});
+    .catch(() => { });
 
+}
+
+/**
+ * N'accepte une lettre reconnue que si l'OCR est assez confiant ; sinon
+ * renvoie "_" pour ne pas fausser le filtrage par regex avec une lettre
+ * probablement incorrecte.
+ */
+function acceptLetter(char, confidence) {
+  return confidence >= LETTER_CONFIDENCE_THRESHOLD ? char : "_";
 }
 
 function loadImage(dataUrl) {
@@ -279,7 +300,7 @@ async function runOcrPipeline(dataUrl, rect, referenceLength = null) {
     if (cached) {
       ocrCache.delete(fingerprint);
       ocrCache.set(fingerprint, cached);
-      letters[index] = cached.char;
+      letters[index] = acceptLetter(cached.char, cached.confidence);
       confidences.push(cached.confidence);
       continue;
     }
@@ -302,7 +323,7 @@ async function runOcrPipeline(dataUrl, rect, referenceLength = null) {
   if (pending.length === 0) {
     schedulerInitialization
       .then(warmAdditionalWorker)
-      .catch(() => {});
+      .catch(() => { });
   } else {
     const scheduler = await schedulerInitialization;
     if (pending.length >= 3) warmAdditionalWorker();
@@ -322,7 +343,7 @@ async function runOcrPipeline(dataUrl, rect, referenceLength = null) {
 
     for (const result of results) {
       for (const index of result.indices) {
-        letters[index] = result.char;
+        letters[index] = acceptLetter(result.char, result.confidence);
         confidences.push(result.confidence);
       }
       ocrCache.set(result.fingerprint, {
